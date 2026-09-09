@@ -50,6 +50,9 @@ If I get paged at 3 AM, the first thing I'm doing is logging in and checking the
 
 ## Cloudformation
 
+Located at /deploy/cloud-formation.yaml
+
+
 The CF template should work from scratch.  All it needs is access to a private repo held in the existing AWS account, which can be completed on my end once I'm sent the information on which AWS account will need access to the repo.  This will be achieved by a policy on the ECR repositories.
 
 The cloudformation will create the following:

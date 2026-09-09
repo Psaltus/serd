@@ -1,0 +1,262 @@
+# SerdSafely
+
+Private file delivery. nginx in front, a Python (FastAPI) backend behind it,
+files in S3.
+
+Delivery only: the app reads from the bucket and never writes to it. Files are
+put there by some other route, and the task role carries no write permission.
+
+nginx serves no HTML of its own: the front page and the custom 4xx/5xx pages
+are all proxied from the backend, so one codebase decides what this service
+looks like. The single exception is a static "temporarily unavailable" page,
+used only when the backend is the thing that has failed and so cannot render
+one itself.
+
+## Layout
+
+```
+backend/app/
+  main.py         app, exception handlers, start-up
+  config.py       settings and their fallbacks
+  parameters.py   reads deployment config from SSM at start-up
+  cache.py        the in-memory index: what exists, what does not
+  storage.py      S3 access and name-to-key rules
+  logging_setup.py  JSON logging, levels, CloudWatch delivery
+  views.py        HTML rendering; one definition of each error
+  routers/        pages (home, errors), files (download), admin
+  templates/      base, home, error
+  s3_config.py    the S3 client
+nginx/            config, shared proxy snippet, static fallback page
+```
+
+## How the cache works
+
+A download never asks S3 whether the file exists — it checks a set in memory,
+so the common case costs nothing. That set is kept current three ways:
+
+1. **Rebuild** — one paginated `ListObjectsV2`, at start-up and on demand via
+   the refresh endpoint. A single LIST returns up to 1000 keys, far cheaper
+   than a HEAD per request.
+2. **HEAD on a miss** — covers a file that appeared in the bucket since the
+   last rebuild, so it is servable without waiting for anything. The result is
+   remembered either way; a key S3 reports as absent is held in a *negative*
+   cache for `negative_cache_seconds`, so a crawler hitting names that do not
+   exist cannot turn into unbounded S3 calls.
+
+The negative cache is why the refresh endpoint matters. If someone asks for a
+file *before* it is put in the bucket, that miss is remembered briefly, and
+adding the file out-of-band will not be noticed until the entry ages out.
+Refreshing clears it:
+
+```bash
+curl -X POST http://localhost/api/refresh     # {"status":"ok","files":3}
+```
+
+Deletions work the same way in reverse: a key that disappears from the bucket
+is evicted when a request for it fails, so the next one is answered from
+memory.
+
+## Endpoints
+
+| Method | Path             | Purpose                                       |
+| ------ | ---------------- | --------------------------------------------- |
+| GET    | `/`              | Front page                                    |
+| GET    | `/docs/{name}`  | Download; streamed, never buffered whole      |
+| POST   | `/api/refresh`   | Rebuild the index from the bucket             |
+| GET    | `/api/logging`   | Current log level                             |
+| POST   | `/api/logging`   | Re-read log level / debug flag and apply them |
+| GET    | `/api/healthz`   | Liveness; does not touch S3                   |
+| GET    | `/errors/{code}` | Error page, fetched by nginx (internal only)  |
+
+Anything under `/api` answers with JSON. Everything else follows `Accept`, so
+a browser gets the styled page and `curl` gets JSON from the same URL.
+
+## Configuration
+
+The bucket is a property of the deployment, not of the image, so it comes from
+**SSM Parameter Store** at start-up. The container carries only `AWS_REGION`
+and `SERDSAFE_PLATFORM_ENV` — both are needed to reach Parameter Store, so
+neither can come from it.
+
+`SERDSAFE_PLATFORM_ENV` names the environment (`dev`, `staging`, `prod`) and
+everything else is read from `/<env>/...`, so one image runs everywhere. It is
+required: a container that guessed its environment could serve another one's
+bucket, so it exits instead.
+
+Parameters are matched on the last segment of their name, directly under
+`/<env>` — the read is **not** recursive, so unrelated parameters filed deeper
+in an environment's subtree are neither fetched nor decrypted:
+
+| Leaf name                 | Meaning                                    |
+| ------------------------- | ------------------------------------------ |
+| `s3_bucket`               | Bucket to serve files from                  |
+| `s3_prefix`               | Key prefix within it                        |
+| `negative_cache_seconds`  | How long a known-missing key is remembered  |
+| `log_level`               | CRITICAL / ERROR / WARNING / INFO / DEBUG   |
+| `debug`                   | `true` forces DEBUG, overriding `log_level` |
+| `cloudwatch_logs_enabled` | Send log events to CloudWatch directly      |
+| `cloudwatch_log_group`    | Overrides the derived group; rarely needed  |
+| `cloudwatch_log_stream`   | Defaults to the container host name         |
+
+Anything else under the path is ignored rather than applied, so an unrelated
+parameter filed alongside cannot reconfigure the app.
+
+Read **once, at start-up**, and deliberately not on the refresh endpoint: that
+re-reads the bucket's *contents*, whereas re-reading *which bucket* while
+running would let long-lived containers drift onto different config with no
+deploy to explain it. If the path is unreadable or holds no recognised
+parameters, the process **exits** rather than starting up healthy and serving
+the wrong bucket.
+
+## Logging
+
+Every line is JSON, so CloudWatch Logs Insights can filter and aggregate on the
+fields rather than matching substrings:
+
+```json
+{"time":"...","level":"INFO","logger":"app.main","message":"GET /docs/a.txt 200",
+ "method":"GET","path":"/docs/a.txt","status":200,"duration_ms":15.8,
+ "request_id":"b333621f114d6e66f27a6d46c413ab2f"}
+```
+
+nginx generates a request id, passes it as `X-Request-Id`, and logs it in its
+own JSON access line, so one request can be followed across both logs:
+
+```
+fields @timestamp, level, message, duration_ms
+| filter request_id = "b333621f114d6e66f27a6d46c413ab2f"
+| sort @timestamp asc
+```
+
+Levels are used deliberately rather than everything landing on INFO: a request
+is logged at the level its outcome deserves (5xx → ERROR, 4xx → WARNING, health
+checks → DEBUG), and cache hits, misses and negative-cache hits are DEBUG.
+
+**Health checks never reach CloudWatch.** A liveness probe runs every few
+seconds for the life of the service; stored, that is a standing ingestion and
+retention charge for the least interesting traffic there is, and it buries real
+events. The filter is attached to the CloudWatch handler alone, so probes still
+appear on stdout — useful when watching a container locally — and it keys off a
+context variable rather than the path, so anything logged *while* serving a
+probe is dropped too, not just the request line. This holds even with `debug`
+on, which is when the volume would otherwise be worst. nginx does the same for
+its own access log, by user agent (`ELB-HealthChecker`, `kube-probe`).
+
+**Getting it into CloudWatch.** Everything goes to stdout, which is what a
+container log driver collects — on ECS the `awslogs` driver forwards it with no
+application involvement, and that is the recommended setup. For anywhere
+without such a driver, `cloudwatch_logs_enabled` attaches a handler that puts
+events into CloudWatch directly, batched on a background thread. Leave it off
+where stdout is already being collected, or you pay to deliver every line
+twice. If that handler cannot start — no permissions, unreachable endpoint —
+it is logged and the app carries on with stdout; logging is never a reason to
+be down.
+
+Delivered directly, the container needs `logs:CreateLogGroup`,
+`logs:CreateLogStream` and `logs:PutLogEvents` on the log group.
+
+### Turning debugging on without a restart
+
+`debug` and `log_level` are the one slice of configuration that can be re-read
+while the process is serving. Debugging gets switched on precisely when
+something is already wrong, and restarting a container to raise its verbosity
+usually destroys the state worth looking at. Everything else — which bucket,
+which prefix — stays start-up only.
+
+```bash
+aws ssm put-parameter --name /prod/debug --value true \
+  --type String --overwrite
+curl -X POST http://localhost/api/logging
+# {"status":"ok","log_level":"DEBUG","debug":true,"reloaded":{"debug":"true",...}}
+```
+
+Set it back to `false` and call it again to return to `log_level`.
+
+## Running it
+
+```bash
+SERDSAFE_PLATFORM_ENV=dev docker compose up --build
+```
+
+The backend reads Parameter Store and writes CloudWatch in whatever AWS account
+its credentials belong to.
+
+### Against a local emulator
+
+`SERDSAFE_LOCAL_STACK` sends **every** AWS call — Parameter Store, S3 and
+CloudWatch alike — to an emulator instead. Set it to the endpoint, or to `true`
+for `http://localhost:4566`:
+
+```bash
+SERDSAFE_LOCAL_STACK=http://host.docker.internal:4566 \
+  SERDSAFE_PLATFORM_ENV=prod docker compose up --build
+```
+
+Note the host name. The emulator listens on *your machine*, and `localhost`
+inside a container means the container, so from compose it has to be reached at
+`host.docker.internal`. Running the app outside a container, plain
+`http://localhost:4566` is right.
+
+Two things happen automatically when it is set: S3 switches to path-style
+addressing (virtual-host style would look for `<bucket>.localhost`, which
+resolves nowhere), and placeholder credentials are supplied if the environment
+has none, since an emulator ignores them but botocore still insists on finding
+some. The app also logs a warning at start-up, so a container pointed at an
+emulator is never mistaken for one talking to AWS.
+
+Whichever it is, the environment needs its parameters to exist:
+
+```bash
+aws --endpoint-url=http://localhost:4566 \
+  ssm put-parameter --name /prod/s3_bucket --value file-repo --type String
+```
+
+Compose refuses to start without `SERDSAFE_PLATFORM_ENV`, and the container
+exits if it is set to something that is not usable as a path segment. Locally
+`~/.aws` is mounted read-only so the container uses the same credentials as
+your CLI; `AWS_PROFILE` and the standard `AWS_*` variables are passed through
+too. Deployed, neither is present and the task role is used instead.
+
+Then http://localhost.
+
+`s3_prefix` is optional and defaults to `uploads/`. A value without a trailing
+slash gets one, and `/` means the bucket root — the only way to express that
+through Parameter Store, which cannot hold an empty value.
+
+### Getting files in
+
+Files go into the bucket directly — the app has no upload endpoint and no
+write permission:
+
+```bash
+aws s3 cp ./some-file.pdf s3://my-bucket/uploads/
+```
+
+It is then at `http://localhost/docs/some-file.pdf`, served straight away: an
+index miss falls back to a single HEAD, so there is no need to wait for
+anything. `POST /api/refresh` rebuilds the whole index when many files have
+been added at once.
+
+### IAM
+
+The task role needs, at minimum:
+
+| Action                      | Resource                                    |
+| --------------------------- | ------------------------------------------- |
+| `ssm:GetParametersByPath`   | `arn:aws:ssm:<region>:<acct>:parameter/<env>` |
+| `s3:ListBucket`             | the bucket, condition `s3:prefix` on the prefix |
+| `s3:GetObject`              | `<bucket>/<prefix>*` — read only, no PutObject |
+| `logs:CreateLogGroup`, `CreateLogStream`, `PutLogEvents` | the log group |
+
+An SSE-KMS bucket also needs `kms:GenerateDataKey` and `kms:Decrypt`.
+
+## Notes
+
+- Requested names must be plain file names. Path-shaped input is rejected
+  rather than flattened, so a caller never gets a file back under a name they
+  did not ask for.
+- nginx caps request bodies at 8k. Nothing here accepts a file, and the POST
+  endpoints that exist carry no body.
+- No infrastructure template is included here yet. Deployed, the container
+  needs `ssm:GetParametersByPath` on its parameter path, plus `s3:ListBucket`
+  on the bucket and `s3:GetObject` under the prefix — no write permission.

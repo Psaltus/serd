@@ -1,0 +1,66 @@
+# Runs the two containers against AWS — real, or an emulator.
+#
+#   Real AWS:
+#     SERDSAFE_PLATFORM_ENV=prod docker compose up --build
+#
+#   Against a LocalStack you are running yourself. Note the host name: the
+#   emulator listens on your machine, and "localhost" inside the container
+#   means the container, so it has to be reached by host.docker.internal.
+#     SERDSAFE_LOCAL_STACK=http://host.docker.internal:4566 \
+#       SERDSAFE_PLATFORM_ENV=prod docker compose up --build
+#
+# Either way the backend reads /<env>/... from Parameter Store and writes its
+# logs to CloudWatch; only the endpoint differs.
+
+services:
+  backend:
+    build: ./backend
+    env_file:
+      - path: ./backend/.env
+        required: false
+    # List form throughout, because the two halves behave differently and both
+    # are needed here. "NAME=value" sets it; a bare "NAME" passes the host's
+    # value through ONLY if the host has one.
+    #
+    # That distinction matters: writing AWS_PROFILE=${AWS_PROFILE:-} sets the
+    # variable to an empty string, and botocore then looks for a profile named
+    # "" and fails with ProfileNotFound before the app starts.
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      # Which environment to be: selects the /<env>/... parameters and the
+      # CloudWatch log group.
+      - SERDSAFE_PLATFORM_ENV=${SERDSAFE_PLATFORM_ENV:-dev}
+      # Unset means real AWS. Set to an endpoint (or just "true" for
+      # localhost:4566) to send every AWS call to an emulator instead. Empty is
+      # safe here — the app reads it as "not set".
+      - SERDSAFE_LOCAL_STACK=${SERDSAFE_LOCAL_STACK:-}
+      # Normally comes from /<env>/s3_prefix; override it locally to point at a
+      # bucket laid out differently. "/" means the bucket root.
+      - S3_PREFIX
+      # Credentials, passed through only when actually set. An emulator ignores
+      # them, and the app supplies placeholders when it finds none.
+      - AWS_PROFILE
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+    extra_hosts:
+      # Docker Desktop resolves this already; declaring it keeps the same
+      # compose file working on Linux, where it is not automatic.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Read-only, so a local run can use the same credentials as the CLI.
+      # Deployed, this is not present and the task role is used instead.
+      - ${HOME}/.aws:/root/.aws:ro
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block body %}
+  <span class="mark">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M12 2.5 4.5 5.8v5.4c0 4.5 3.1 8.4 7.5 9.8 4.4-1.4 7.5-5.3 7.5-9.8V5.8Z" />
+      <path d="m9 12.2 2.2 2.2L15.4 10" />
+    </svg>
+    Secure delivery
+  </span>
+
+  <h1>Serd<span class="tail">Safely</span></h1>
+
+  <p class="lede">
+    Private file delivery for people who would rather not email attachments
+    around.
+  </p>
+
+  <section class="panel">
+    <h2>What to expect</h2>
+    <ul class="points">
+      <li>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20 6 9 17l-5-5" />
+        </svg>
+        <span>Files are encrypted at rest and only travel over HTTPS.</span>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20 6 9 17l-5-5" />
+        </svg>
+        <span>There is no directory to browse. You need the exact link to open
+          a file, and links are shared with you directly.</span>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20 6 9 17l-5-5" />
+        </svg>
+        <span>A file you have been sent is at <code>/docs/&lt;name&gt;</code>.</span>
+      </li>
+    </ul>
+  </section>
+
+  <footer>
+    {{ indexed }} file{{ '' if indexed == 1 else 's' }} available.
+    Need one that isn't reaching you? Ask whoever sent the link.
+  </footer>
+{% endblock %}

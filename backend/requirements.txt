@@ -1,0 +1,8 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+boto3==1.35.0
+pydantic-settings==2.5.2
+jinja2==3.1.4
+# Only used when CloudWatch delivery is switched on; stdout logging has no
+# dependency beyond the standard library.
+watchtower==3.3.1

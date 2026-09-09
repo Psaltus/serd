@@ -1,0 +1,140 @@
+@startuml serdsafely-architecture
+' SerdSafely / static-files service — deployment architecture.
+'
+' Renders with a stock PlantUML (no !include, no sprite libraries):
+'   plantuml deploy/architecture.puml          -> architecture.png
+'   plantuml -tsvg deploy/architecture.puml    -> architecture.svg
+'
+' Layout notes: edge labels are kept to a single step number and explained in
+' the legend, and cross-cutting concerns (IAM, image pulls) are described in
+' the node they belong to rather than drawn as long arrows. Both keep the
+' graph sparse enough that labels do not collide.
+
+title SerdSafely — static file delivery on ECS Fargate\nedge: AWS WAF and Cognito authentication in front of the load balancer
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam defaultFontSize 12
+skinparam roundCorner 8
+skinparam nodesep 45
+skinparam ranksep 55
+skinparam padding 3
+skinparam ArrowColor #37474F
+skinparam ArrowFontSize 12
+skinparam ArrowFontColor #B71C1C
+skinparam ArrowFontStyle bold
+
+skinparam rectangle {
+  BorderColor #546E7A
+  BackgroundColor #ECEFF1
+  FontColor #263238
+}
+skinparam rectangle<<edge>> {
+  BackgroundColor #FDE7E9
+  BorderColor #C62828
+  FontColor #7F1D1D
+}
+skinparam rectangle<<net>> {
+  BackgroundColor #E8EAF6
+  BorderColor #3949AB
+}
+skinparam rectangle<<compute>> {
+  BackgroundColor #FFF3E0
+  BorderColor #EF6C00
+}
+skinparam rectangle<<data>> {
+  BackgroundColor #E8F5E9
+  BorderColor #2E7D32
+}
+skinparam rectangle<<ops>> {
+  BackgroundColor #F3E5F5
+  BorderColor #6A1B9A
+}
+skinparam package {
+  BorderColor #90A4AE
+  BackgroundColor #FAFAFA
+  FontColor #37474F
+}
+
+actor "Visitor\n(browser)" as user
+
+package "AWS account — region (default us-east-1)" {
+
+  package "DNS and TLS" {
+    rectangle "**Route 53**\nA/ALIAS record for DomainName\nstatic-files.{account}.serdsafely.com" as r53 <<net>>
+    rectangle "**ACM**\nTLS certificate — CertificateArn,\nor requested and DNS-validated" as acm <<net>>
+  }
+
+  package "Edge controls — in front of the load balancer" {
+    rectangle "**AWS WAF v2 — Web ACL**\nassociated with the ALB ARN\nAWS managed rule groups\nrate-based rule per source IP\nblocked requests never reach the ALB" as waf <<edge>>
+    rectangle "**Amazon Cognito**\nuser pool and hosted UI (OIDC)\ncallback /oauth2/idpresponse\nsets AWSELBAuthSessionCookie\nadds x-amzn-oidc-data / -identity" as cognito <<edge>>
+  }
+
+  package "VPC (VpcId)" {
+
+    package "Application Load Balancer — internet-facing\nsubnets: LoadBalancerSubnetIds, else SubnetIds\nsecurity group: IngressCidr to :80 and :443" {
+      rectangle "**HTTP :80 listener**\nredirect 301 to HTTPS" as l80 <<net>>
+      rectangle "**HTTPS :443 listener**\naction 1 — authenticate-cognito\naction 2 — forward" as l443 <<net>>
+      rectangle "**Target group**\nHTTP :80, target type ip\nhealth check GET /api/healthz\n15s interval, 5s timeout" as tg <<net>>
+    }
+
+    package "Task subnets (SubnetIds) — AssignPublicIp ENABLED by default\ntask security group: :80 from the ALB security group only" {
+      package "ECS cluster (Fargate) — service of DesiredCount tasks\ntask definition: TaskCpu / TaskMemory, images pulled from ECR" {
+        rectangle "**nginx container** :80\nsole ingress into the task\nclient_max_body_size 8k\nerror_page 4xx/5xx to backend /errors/{status}\n@unavailable static fallback.html\n/docs/ proxied unbuffered (streaming)\nJSON access log to stdout" as nginx <<compute>>
+        rectangle "**backend container** :8000\nFastAPI on uvicorn\nGET /  home page and file index\nGET /docs/{name}  download, relayed from S3\nGET /errors/{status}\nPOST /api/refresh  rebuild the index\nGET, POST /api/logging\nGET /api/healthz\nin-memory key cache; a miss re-checks S3" as backend <<compute>>
+      }
+    }
+  }
+
+  package "Application data and configuration" {
+    rectangle "**SSM Parameter Store**\n/{PlatformEnv}/s3_bucket\n/{PlatformEnv}/s3_prefix\nplus runtime logging settings" as ssm <<data>>
+    rectangle "**S3 bucket** (S3BucketName)\nprefix S3Prefix, default uploads/\nListObjectsV2, HeadObject, GetObject" as s3 <<data>>
+    rectangle "**Amazon ECR**\nBackendImage and NginxImage\npulled by the execution role" as ecr <<data>>
+  }
+
+  package "Observability, scaling and IAM" {
+    rectangle "**CloudWatch Logs**\none log group per container,\nLogRetentionDays\nawslogs driver plus a direct\nhandler in the backend" as cwl <<ops>>
+    rectangle "**Alarm and auto scaling**\nServiceCpuHighAlarm, CPU above 80%\ntarget tracking at 80% over 10 min\nadjusts the ECS service task count" as asg <<ops>>
+    rectangle "**IAM roles**\nexecution role — ECR pull, log streams\ntask role — s3:ListBucket, s3:GetObject,\nssm:GetParametersByPath, logs:PutLogEvents" as iam <<ops>>
+  }
+}
+
+' --- request path: one short label per hop, explained in the legend ---------
+user     --> r53  : 1
+r53      --> waf  : 2
+waf      --> l80  : 3
+waf      --> l443 : 3
+l80      --> l443 : 4
+l443     --> cognito : 5
+cognito  --> l443 : 5
+l443     --> tg   : 6
+tg       --> nginx : 7
+nginx    --> backend : 8
+
+' --- supporting relationships ----------------------------------------------
+acm     ..> l443 : certificate
+r53     ..> l443 : alias target
+backend ..> ssm  : at start-up
+backend ..> s3   : list and stream
+backend ..> cwl
+nginx   ..> cwl
+ecr     ..> nginx : image pull
+iam     ..> backend : assumed by the task
+asg     ..> nginx : scales
+
+legend right
+  **Request path**
+  1  Visitor resolves the record and connects over HTTPS.
+  2  The Web ACL inspects the request first; a blocked one is answered 403 at the edge.
+  3  Allowed traffic reaches the listeners.
+  4  Port 80 redirects to 443, which terminates TLS with the ACM certificate.
+  5  authenticate-cognito — no valid session means hosted-UI login, code exchange,
+  \t session cookie set and identity headers added to the request.
+  6  The authenticated request is forwarded to the target group.
+  7  The target group reaches the task ENI on :80, the nginx container.
+  8  nginx proxies to the backend on :8000, carrying X-Request-Id so both
+  \t log groups can be correlated.
+endlegend
+
+@enduml

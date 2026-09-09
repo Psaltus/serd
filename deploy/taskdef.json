@@ -1,0 +1,93 @@
+{
+  "family": "serdsafe",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::713829883394:role/serdsafe-ecs-execution",
+  "taskRoleArn": "arn:aws:iam::713829883394:role/serdsafe-task",
+  "containerDefinitions": [
+    {
+      "name": "backend",
+      "image": "713829883394.dkr.ecr.us-east-2.amazonaws.com/serdsafe/backend:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "name": "backend-8000",
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "SERDSAFE_PLATFORM_ENV",
+          "value": "prod"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "us-east-2"
+        },
+        {
+          "name": "CLOUDWATCH_LOGS_ENABLED",
+          "value": "false"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3).status==200 else 1)\""
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "stopTimeout": 60,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/prod/serdsafely/backend",
+          "awslogs-region": "us-east-2",
+          "awslogs-stream-prefix": "backend"
+        }
+      }
+    },
+    {
+      "name": "nginx",
+      "image": "713829883394.dkr.ecr.us-east-2.amazonaws.com/serdsafe/nginx:latest",
+      "essential": true,
+      "dependsOn": [
+        {
+          "containerName": "backend",
+          "condition": "HEALTHY"
+        }
+      ],
+      "portMappings": [
+        {
+          "name": "nginx-80",
+          "containerPort": 80,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "BACKEND_HOST",
+          "value": "127.0.0.1"
+        }
+      ],
+      "stopTimeout": 30,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/prod/serdsafely/nginx",
+          "awslogs-region": "us-east-2",
+          "awslogs-stream-prefix": "nginx"
+        }
+      }
+    }
+  ]
+}

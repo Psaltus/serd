@@ -1,0 +1,913 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  serdsafe on ECS Fargate, end to end: cluster, task definition, roles,
+  internet-facing Application Load Balancer with its listeners and target
+  group, service, autoscaling target and a CPU alarm. Given a VPC, two
+  subnets and container images, this stands the application up from nothing.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Service identity }
+        Parameters: [ClusterName, CreateEcsCluster, ServiceName, TaskFamily]
+      - Label: { default: Network }
+        Parameters: [VpcId, SubnetIds, LoadBalancerSubnetIds, AssignPublicIp]
+      - Label: { default: TLS and DNS }
+        Parameters: [CertificateArn, DomainName, HostedZoneId]
+      - Label: { default: Load balancer }
+        Parameters: [IngressCidr, EnableDeletionProtection]
+      - Label: { default: Application }
+        Parameters: [BackendImage, NginxImage, PlatformEnv, S3BucketName, S3Prefix]
+      - Label: { default: Sizing }
+        Parameters: [TaskCpu, TaskMemory, DesiredCount, LogRetentionDays]
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+
+Parameters:
+
+  ClusterName:
+    Type: String
+    Default: app-serdsafe-prod01
+    Description: ECS cluster to deploy into. Created by this stack unless CreateEcsCluster is false.
+
+  CreateEcsCluster:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Create the cluster named above. Set false to deploy into a cluster that
+      already exists - CloudFormation cannot adopt one it did not create, so
+      leaving this true against an existing cluster fails with
+      "already exists".
+
+  ServiceName:
+    Type: String
+    Default: app-serdsafe-prod01-service
+    MinLength: 1
+    MaxLength: 28
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9-]*$
+    Description: >-
+      Name of the ECS service. Capped at 28 characters because the load
+      balancer and target group derive their names from it, and ELB caps
+      those at 32.
+    ConstraintDescription: Letters, digits and hyphens, starting alphanumeric, 28 characters or fewer.
+
+  TaskFamily:
+    Type: String
+    Default: app-serdsafe-prod01
+    Description: >-
+      Task definition family. Revisions accumulate under this name, so it is
+      the handle you roll back with.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >-
+      VPC the load balancer and tasks live in. On an otherwise empty account
+      the default VPC works: it has an internet gateway and a public subnet
+      per availability zone, which is what the internet-facing load balancer
+      below needs.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      Subnets the tasks deploy into. At least two, in different availability
+      zones. Also used for the load balancer unless LoadBalancerSubnetIds is
+      given.
+
+  LoadBalancerSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      Optional. Public subnets for the load balancer, when the tasks belong
+      somewhere private. Leave empty to put both in SubnetIds - correct for a
+      default VPC, where every subnet is public. Whichever subnets are used
+      here must route to an internet gateway, or the load balancer will not
+      create.
+
+  AssignPublicIp:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >-
+      Tasks must reach ECR, CloudWatch Logs, Parameter Store and S3. ENABLED
+      is the default because it is the only thing that works in a default VPC,
+      which has no NAT gateway - and it does not expose the tasks, since their
+      security group accepts traffic from the load balancer alone. Set
+      DISABLED once the tasks sit in private subnets behind a NAT gateway or
+      VPC endpoints.
+
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ACM certificate for the HTTPS listener. Leave empty to have the stack
+      request one for DomainName and validate it through HostedZoneId, which
+      is what an account with a hosted zone but no certificate yet should do.
+
+  DomainName:
+    Type: String
+    Default: ""
+    Description: >-
+      Name the service is served under, e.g. files.example.com. Required when
+      CertificateArn is empty. When given together with HostedZoneId, an alias
+      record pointing at the load balancer is created too.
+
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: >-
+      Route 53 hosted zone holding DomainName. Used to validate the requested
+      certificate and to create the alias record.
+
+  IngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: >-
+      Who may reach the load balancer. 0.0.0.0/0 is the point of an
+      internet-facing balancer; narrow it for a staging stack that should not
+      be public.
+
+  EnableDeletionProtection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Turn on for anything long-lived. Left off by default so a stack stood up
+      to try this out can be deleted again without a separate console step.
+
+  BackendImage:
+    Type: String
+    Default: 713829883394.dkr.ecr.us-east-2.amazonaws.com/serdsafe/backend:latest
+    Description: >-
+      Backend image. Must already exist and be pullable by this account -
+      see the note in the README, this is the one prerequisite the stack
+      cannot create for itself. Prefer an immutable tag or a digest over
+      :latest, so a task definition revision identifies exactly one build.
+
+  NginxImage:
+    Type: String
+    Default: 713829883394.dkr.ecr.us-east-2.amazonaws.com/serdsafe/nginx:latest
+    Description: nginx image. Same advice as BackendImage.
+
+  PlatformEnv:
+    Type: String
+    Default: prod
+    Description: >-
+      Selects the application's Parameter Store namespace, /<PlatformEnv>/*,
+      and is passed to the backend as SERDSAFE_PLATFORM_ENV.
+
+  S3BucketName:
+    Type: String
+    Default: file-repo
+    Description: Bucket the application serves documents out of. Read only.
+
+  S3Prefix:
+    Type: String
+    Default: uploads/
+    Description: >-
+      Key prefix within that bucket. The task role is scoped to it, so a
+      change here is a change to what the task may read.
+
+  TaskCpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+    Description: >-
+      Task CPU units, shared by uvicorn and nginx. 256 measured comfortably at
+      40 concurrent downloads; CPU is the likelier limit before memory.
+
+  TaskMemory:
+    Type: String
+    Default: "512"
+    Description: >-
+      Task memory in MiB; must be a combination Fargate accepts for TaskCpu.
+      Downloads stream in 64 KB chunks, so memory does not scale with file
+      size - about 89 MB measured under load against this 512 MB limit.
+
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    Description: >-
+      Tasks to run. Application Auto Scaling owns this value after the first
+      deploy - see the note on ServiceScalableTarget.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+    Description: Retention on both container log groups.
+
+# ---------------------------------------------------------------------------
+# Rules
+#
+# Caught at stack creation, with the message below, rather than several
+# minutes in as an opaque failure from ELB about a malformed certificate ARN.
+# ---------------------------------------------------------------------------
+
+Rules:
+
+  CertificateIsObtainable:
+    Assertions:
+      - Assert: !Or
+          - !Not [!Equals [!Ref CertificateArn, ""]]
+          - !And
+              - !Not [!Equals [!Ref DomainName, ""]]
+              - !Not [!Equals [!Ref HostedZoneId, ""]]
+        AssertDescription: >-
+          The HTTPS listener needs a certificate. Either pass CertificateArn,
+          or pass DomainName and HostedZoneId so the stack can request and
+          validate one. A certificate is the one thing here that depends on
+          owning a domain, and no template can conjure it.
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+
+Conditions:
+
+  CreateCluster: !Equals [!Ref CreateEcsCluster, "true"]
+
+  HasDomainName: !Not [!Equals [!Ref DomainName, ""]]
+
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+
+  CreateCertificate: !And
+    - !Equals [!Ref CertificateArn, ""]
+    - !Condition HasDomainName
+    - !Condition HasHostedZone
+
+  CreateDnsRecord: !And
+    - !Condition HasDomainName
+    - !Condition HasHostedZone
+
+  # An empty CommaDelimitedList joins to an empty string; a populated one
+  # does not. This is the usual way to ask whether an optional list parameter
+  # was supplied.
+  HasDedicatedLbSubnets: !Not
+    - !Equals [!Join ["", !Ref LoadBalancerSubnetIds], ""]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+
+Resources:
+
+  # -- Cluster -------------------------------------------------------------
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Condition: CreateCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      ClusterSettings:
+        # Cluster and service level metrics. "enhanced" would add per-task CPU
+        # and memory, which is what tells you whether the 256/512 sizing still
+        # holds, but it is billed per metric per task - worth turning on while
+        # sizing, not worth leaving on. The service CPU metric the alarm below
+        # watches is published either way.
+        - Name: containerInsights
+          Value: enabled
+      # Registered so a non-production copy of this stack can be moved onto
+      # spot by overriding the service, without touching the cluster. The
+      # service itself pins LaunchType: FARGATE, so no default strategy is set
+      # here - two ways of choosing the same thing is how they drift apart.
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+
+  # -- Logging -------------------------------------------------------------
+  #
+  # Created here rather than by the awslogs driver: the execution role is not
+  # granted logs:CreateLogGroup, so a missing group is a task that fails to
+  # start rather than one that quietly logs nowhere. Owning the groups here
+  # also means retention is set from the first line written.
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: !Sub /${PlatformEnv}/serdsafely/backend
+      RetentionInDays: !Ref LogRetentionDays
+
+  NginxLogGroup:
+    Type: AWS::Logs::LogGroup
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: !Sub /${PlatformEnv}/serdsafely/nginx
+      RetentionInDays: !Ref LogRetentionDays
+
+  # -- Deployment configuration --------------------------------------------
+  #
+  # The image does not know which bucket it serves. SERDSAFE_PLATFORM_ENV
+  # names a Parameter Store path, everything under it is read once at
+  # start-up, and that is how one image runs in dev, staging and production.
+  #
+  # These are not optional decoration: load_parameters() treats an empty path
+  # as fatal and exits rather than starting a container that looks healthy
+  # while serving nothing. On a fresh account nothing else would create them,
+  # so the first deploy would come up, fail every task, and roll back.
+  #
+  # CloudFormation owns these values once created. Editing either in the
+  # console will be reverted by the next stack update - change the stack
+  # parameter instead.
+
+  S3BucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${PlatformEnv}/s3_bucket
+      Description: !Sub Bucket ${ServiceName} serves documents from.
+      Type: String
+      Value: !Ref S3BucketName
+
+  # Written alongside it deliberately. The task role below is scoped to
+  # S3Prefix, and the application falls back to its own built-in default when
+  # this parameter is absent - so overriding S3Prefix without this would grant
+  # access to one prefix while the application went on reading another, and
+  # every download would 403. Setting both from the same stack parameter keeps
+  # the grant and the behaviour from disagreeing.
+  S3PrefixParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${PlatformEnv}/s3_prefix
+      Description: !Sub Key prefix within the bucket ${ServiceName} serves.
+      Type: String
+      Value: !Ref S3Prefix
+
+  # -- Roles ---------------------------------------------------------------
+  #
+  # Two roles, because they are used by two different parties at two different
+  # times. The execution role is assumed by the ECS agent before the
+  # containers exist, to pull the images and open the log streams. The task
+  # role is assumed by the application itself, once running. Neither needs the
+  # other's permissions, so they do not share.
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ServiceName}-execution
+      Description: Pulls images and writes log streams for the serdsafe task.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              # Stops the role being assumable on behalf of a task in some
+              # other account that happens to know this ARN.
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: write-to-the-two-log-groups
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The managed policy already allows this against "*". Naming the
+              # groups documents the only two it needs, and keeps working if
+              # the managed policy is later swapped for a tighter one.
+              - Sid: WriteContainerLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub ${BackendLogGroup.Arn}:*
+                  - !Sub ${NginxLogGroup.Arn}:*
+
+  # The role the requirement asks for: what the application may touch in this
+  # account. Deliberately read-only. The service delivers files and never
+  # accepts one, so there is no s3:PutObject, no s3:DeleteObject and no write
+  # anywhere else. An upload path would be a change to this policy, and should
+  # be reviewed as one.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ServiceName}-task
+      Description: What the serdsafe application itself may do in this account.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*
+      Policies:
+        - PolicyName: serve-documents-from-s3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+
+              # Startup reads /<env>/* to learn the bucket, the prefix and the
+              # rest of its configuration. GetParametersByPath authorises
+              # against the path, not against each parameter under it.
+              # GetParametersByPath authorises against the path, not against
+              # each parameter under it. Both ARNs are listed because the two
+              # readings of "the path" - the node itself and what sits beneath
+              # it - are not worth a failed deploy to be clever about, and the
+              # only action granted here cannot do anything else with either.
+              - Sid: ReadDeploymentConfig
+                Effect: Allow
+                Action: ssm:GetParametersByPath
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${PlatformEnv}
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${PlatformEnv}/*
+
+              # ListBucket is granted on the bucket, so the prefix condition is
+              # what actually confines it. Without the condition this would
+              # allow enumerating every key in the bucket, which is more than
+              # indexing the served prefix requires.
+              - Sid: ListOnlyTheServedPrefix
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${S3BucketName}
+                Condition:
+                  StringLike:
+                    s3:prefix: !Sub ${S3Prefix}*
+
+              # Reads are scoped to the same prefix, so a key that escaped the
+              # prefix-joining in storage.py still cannot be fetched.
+              - Sid: ReadObjectsUnderThatPrefix
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${S3BucketName}/${S3Prefix}*
+
+  # -- Security groups -----------------------------------------------------
+  #
+  # Two groups referencing each other rather than CIDRs: the tasks accept
+  # traffic from the load balancer's group, whatever addresses it happens to
+  # have. That holds as the load balancer's ENIs move, and it is why the tasks
+  # stay unreachable even when AssignPublicIp is ENABLED.
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Internet-facing load balancer for ${ServiceName}.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: HTTP, redirected to HTTPS
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref IngressCidr
+        - Description: HTTPS
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref IngressCidr
+      SecurityGroupEgress:
+        # The balancer only ever needs to reach the targets. Left at
+        # allow-all it would be a permitted egress path out of the VPC.
+        - Description: To the tasks
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          DestinationSecurityGroupId: !Ref TaskSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceName}-alb
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Tasks for ${ServiceName}. Reachable only from the load balancer.
+      VpcId: !Ref VpcId
+      # Egress is left at the default allow-all: the task has to reach ECR,
+      # CloudWatch Logs, Parameter Store and S3, and pinning that to prefix
+      # lists belongs with whoever owns the VPC's endpoint layout.
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceName}-tasks
+
+  # Declared separately rather than inline on TaskSecurityGroup: the two
+  # groups refer to each other, and inline rules would make that a circular
+  # dependency CloudFormation cannot order.
+  TaskSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: nginx, from the load balancer only
+      GroupId: !Ref TaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  # -- Certificate and DNS -------------------------------------------------
+
+  # DNS validation against a hosted zone this account controls, so ACM writes
+  # its own validation record and the stack completes unattended. Email
+  # validation would leave the stack waiting on a human clicking a link.
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: CreateCertificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateDnsRecord
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      # An alias, not a CNAME: it resolves at the zone apex, costs nothing to
+      # query, and follows the balancer's addresses without a TTL to wait out.
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+  # -- Load balancer -------------------------------------------------------
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ServiceName}-alb
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+      Subnets: !If
+        - HasDedicatedLbSubnets
+        - !Ref LoadBalancerSubnetIds
+        - !Ref SubnetIds
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: !Ref EnableDeletionProtection
+        # The default 60s is measured between packets, and a streamed download
+        # keeps packets moving, so this is really headroom for the pause
+        # before the first byte while the backend opens the object in S3.
+        - Key: idle_timeout.timeout_seconds
+          Value: "120"
+        # Requests carrying headers that do not parse are rejected here rather
+        # than being normalised and passed to nginx, which is where request
+        # smuggling between the two would start.
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
+        - Key: routing.http.desync_mitigation_mode
+          Value: defensive
+        # The balancer terminates TLS, so without this nginx cannot tell an
+        # HTTPS request from a plaintext one and neither can the backend.
+        - Key: routing.http.xff_header_processing.mode
+          Value: append
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceName}-alb
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ServiceName}-tg
+      VpcId: !Ref VpcId
+      Port: 80
+      Protocol: HTTP
+      # Required by awsvpc: tasks are registered by ENI address, not instance.
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      # nginx drops ELB-HealthChecker out of its access log by user agent and
+      # the backend logs this path at DEBUG, so polling it costs no log volume.
+      HealthCheckPath: /api/healthz
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        # A draining target keeps serving what it already started. Downloads
+        # run under a 300s proxy_read_timeout, so a short delay here would cut
+        # transfers mid-file on every deploy; 120s covers the common case
+        # without holding a deployment open for the tail.
+        - Key: deregistration_delay.timeout_seconds
+          Value: "120"
+        # Round-robin would send a new request to a task already streaming
+        # several large files. This sends it to whichever task is least busy.
+        - Key: load_balancing.algorithm.type
+          Value: least_outstanding_requests
+
+  # Port 80 exists only to send callers to 443. An ALB cannot forward between
+  # listeners, so "HTTP 80 -> 443" is a redirect: the client re-requests over
+  # TLS and no plaintext request ever reaches a target.
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            Host: "#{host}"
+            Path: /#{path}
+            Query: "#{query}"
+            # Permanent: the HTTP endpoint is never the right one, so callers
+            # and crawlers should stop asking for it.
+            StatusCode: HTTP_301
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !If [CreateCertificate, !Ref Certificate, !Ref CertificateArn]
+      # TLS 1.2 floor, TLS 1.3 preferred. Everything below 1.2 is broken, and
+      # nothing that can reach an ALB today is unable to negotiate 1.2.
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # -- Task definition -----------------------------------------------------
+  #
+  # nginx is the container the load balancer talks to, but it cannot run
+  # alone: it depends on the backend being HEALTHY and proxies to it on
+  # loopback. Under awsvpc both containers share one network namespace, which
+  # is why BACKEND_HOST is 127.0.0.1 and not a container name.
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref TaskFamily
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        # Must stay X86_64: the images are built --platform linux/amd64 and
+        # fail on ARM64 with "exec format error".
+        CpuArchitecture: X86_64
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+
+        - Name: backend
+          Image: !Ref BackendImage
+          Essential: true
+          PortMappings:
+            - Name: backend-8000
+              ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: SERDSAFE_PLATFORM_ENV
+              Value: !Ref PlatformEnv
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            # The application's own CloudWatch shipper stays off: awslogs
+            # already carries stdout, and both on would bill every line twice.
+            # This can still be overridden by a
+            # /<env>/cloudwatch_logs_enabled parameter, which is applied after
+            # the environment.
+            - Name: CLOUDWATCH_LOGS_ENABLED
+              Value: "false"
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3).status==200 else 1)"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          # In-flight downloads are streamed and can be long; give uvicorn room
+          # to finish rather than cutting a transfer at the default 30s.
+          StopTimeout: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+
+        - Name: nginx
+          Image: !Ref NginxImage
+          Essential: true
+          DependsOn:
+            # Not merely "started": nginx resolves the upstream at startup, and
+            # a backend that is up but not yet serving would leave it fronting
+            # 502s for the first requests after a deploy.
+            - ContainerName: backend
+              Condition: HEALTHY
+          PortMappings:
+            - Name: nginx-80
+              ContainerPort: 80
+              Protocol: tcp
+          Environment:
+            - Name: BACKEND_HOST
+              Value: 127.0.0.1
+          StopTimeout: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref NginxLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: nginx
+
+  # -- Service -------------------------------------------------------------
+
+  Service:
+    Type: AWS::ECS::Service
+    # The target group must be attached to a listener before ECS will register
+    # tasks into it; without this the first create races and fails.
+    DependsOn:
+      - HttpsListener
+      - HttpListener
+      - TaskSecurityGroupIngress
+      # Without these the first deploy races: the parameters are what the
+      # backend reads at start-up, and it exits if they are not there yet.
+      - S3BucketParameter
+      - S3PrefixParameter
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !If [CreateCluster, !GetAtt Cluster.Arn, !Ref ClusterName]
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref TaskSecurityGroup]
+          AssignPublicIp: !Ref AssignPublicIp
+      LoadBalancers:
+        - ContainerName: nginx
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroup
+
+      # Justification: this is the window in which ALB health checks cannot
+      # kill a task, so it has to cover the slowest legitimate start. A task
+      # is not ready until the backend clears its own health check - a 30s
+      # start period, then a 30s interval - and only then does nginx start and
+      # begin answering. Add ENI attachment and image pull ahead of that, and
+      # two passing ALB checks 15s apart behind it, and a cold start lands
+      # near 90s. 120s leaves margin for a slow pull without being so long
+      # that a genuinely broken task sits in service unchecked; the circuit
+      # breaker below, not this grace period, is what catches that case.
+      HealthCheckGracePeriodSeconds: 120
+
+      DeploymentConfiguration:
+        # 100/200 with a desired count of 2: the two old tasks keep serving
+        # until two new ones are healthy, so capacity never dips during a
+        # deploy. The cost is briefly paying for four tasks, which at this
+        # size is not worth trading availability for. 50/200 would be the
+        # choice if the task count were large enough for the doubling to
+        # matter.
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          # A bad image, or a task role that cannot reach the bucket, fails
+          # the same way every time, so retrying only extends the outage.
+          # Fail the deployment and put the last known-good task definition
+          # back without waiting for someone to notice.
+          Enable: true
+          Rollback: true
+      PropagateTags: SERVICE
+      EnableECSManagedTags: true
+      Tags:
+        - Key: Name
+          Value: !Ref ServiceName
+
+  # -- Autoscaling ---------------------------------------------------------
+  #
+  # MinCapacity 0 is what was asked for, and it is worth being explicit about
+  # what it means: Application Auto Scaling is allowed to take this service to
+  # zero tasks, at which point the load balancer has no healthy targets and
+  # the service is down. That is reasonable for an environment meant to idle
+  # to nothing and dangerous for one that should always serve. The
+  # target-tracking policy below will not do it on its own - it stops at 1 -
+  # but a scheduled action or a manual call can. Raise MinCapacity to 1 or 2
+  # if this service is meant to always be serving.
+  #
+  # Note also that MinCapacity 0 and DesiredCount 2 are two owners of the same
+  # number. After the first deploy autoscaling owns it; a later stack update
+  # pushes DesiredCount back to 2 and briefly undoes whatever scaling settled
+  # on.
+
+  ServiceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: Service
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub service/${ClusterName}/${ServiceName}
+      MinCapacity: 0
+      MaxCapacity: 8
+      # No RoleARN: Application Auto Scaling uses the
+      # AWSServiceRoleForApplicationAutoScaling_ECSService service-linked
+      # role, which it creates on first use.
+
+  # A scalable target on its own only sets bounds - nothing moves without a
+  # policy. Target tracking on CPU keeps the fleet near 60%, which leaves
+  # headroom to absorb a spike while the new tasks start.
+  ServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ServiceName}-cpu-target-tracking
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ServiceScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 80
+        # Out fast, in slow: a new task takes about 90s to serve, so scaling
+        # up late is a queue, while scaling down early is a second scale-up.
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
+
+  # -- Alarm ---------------------------------------------------------------
+
+  ServiceCpuHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ServiceName}-cpu-high
+      AlarmDescription: >-
+        Service CPU above 80% for two consecutive minutes. Above the
+        autoscaling target of 60%, so this fires when scaling is not keeping
+        up - or cannot, at MaxCapacity - rather than every time it works.
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+        - Name: ServiceName
+          Value: !Ref ServiceName
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      # A service scaled to 0 tasks publishes no CPU metric. notBreaching
+      # keeps that from being reported as high CPU. It does mean this alarm
+      # says nothing about a service that is down - that is a separate alarm,
+      # on the target group's healthy host count.
+      TreatMissingData: notBreaching
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+Outputs:
+
+  ServiceUrl:
+    Description: >-
+      Where the application is served. The load balancer's own name only
+      answers cleanly over HTTP, which redirects to HTTPS - over TLS it will
+      not match the certificate unless DomainName was configured.
+    Value: !If
+      - HasDomainName
+      - !Sub https://${DomainName}
+      - !Sub http://${LoadBalancer.DNSName}
+
+  LoadBalancerDnsName:
+    Description: DNS name of the load balancer, for an alias record in a zone this stack does not manage.
+    Value: !GetAtt LoadBalancer.DNSName
+
+  LoadBalancerCanonicalHostedZoneId:
+    Description: Zone ID to pair with that DNS name when creating the alias yourself.
+    Value: !GetAtt LoadBalancer.CanonicalHostedZoneID
+
+  ServiceArn:
+    Description: ARN of the ECS service.
+    Value: !Ref Service
+
+  TaskDefinitionArn:
+    Description: Task definition revision this stack last deployed.
+    Value: !Ref TaskDefinition
+
+  TargetGroupArn:
+    Description: Target group the HTTPS listener forwards to.
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-TargetGroupArn
+
+  TaskRoleArn:
+    Description: Role the application assumes. Grant it further access here.
+    Value: !GetAtt TaskRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-TaskRoleArn
+
+  TaskSecurityGroupId:
+    Description: Security group on the tasks.
+    Value: !Ref TaskSecurityGroup
+
+  LoadBalancerSecurityGroupId:
+    Description: Security group on the load balancer.
+    Value: !Ref LoadBalancerSecurityGroup

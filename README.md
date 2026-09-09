@@ -1,4 +1,6 @@
-# SendSafely Interview Readme
+# SerdSafe Readme
+
+This is not intended to be anything more than code for an interview.
 
 Deliverables:
 
